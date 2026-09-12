@@ -51,3 +51,17 @@ DEFAULT_RECOVERY_SCAN_INTERVAL_SECONDS = 300
 
 DEFAULT_MAX_FILE_SIZE_MB = 500
 VIDEO_FRAME_SAMPLE_INTERVAL_SECONDS = 10
+
+
+def compute_backoff_seconds(
+    attempt: int,
+    base_seconds: int = DEFAULT_BACKOFF_BASE_SECONDS,
+    max_seconds: int = DEFAULT_BACKOFF_MAX_SECONDS,
+) -> int:
+    """Exponential backoff with a ceiling: base * 2**attempt, capped."""
+    if attempt < 0:
+        raise ValueError("attempt must be non-negative")
+    # int ** int is typed as returning Any in typeshed (a negative exponent
+    # would produce a float), even though attempt is guaranteed >= 0 here.
+    doubled: int = base_seconds * (2**attempt)
+    return min(doubled, max_seconds)
