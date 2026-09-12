@@ -43,7 +43,17 @@ class CeleryJobDispatcher:
     """Implements JobDispatcherProtocol on top of the Celery task queue."""
 
     def dispatch(self, job_id: JobId, tenant_id: TenantId) -> None:
-        process_job_task.delay(str(job_id), str(tenant_id))
+        # A deterministic task_id (rather than Celery's random default)
+        # means a duplicate dispatch of the same job -- e.g. a client
+        # retrying a timed-out submission -- converges on one canonical
+        # AsyncResult instead of scattering across untraceable ids. The
+        # actual at-least-once safety net is ProcessJob's deterministic
+        # execution ids: a genuinely concurrent duplicate still resolves
+        # correctly there, via a unique constraint plus Celery's own retry.
+        process_job_task.apply_async(
+            args=(str(job_id), str(tenant_id)),
+            task_id=f"process-job-{job_id}",
+        )
 
 
 @celery_app.task(bind=True, max_retries=settings.celery_max_retries, name="process_job_task")  # type: ignore[misc]
