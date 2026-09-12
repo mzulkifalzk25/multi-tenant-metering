@@ -1,85 +1,93 @@
-# Async Document Pipeline
+# Multi-Tenant Metering
 
-Production-grade async document processing pipeline with idempotent, non-destructive job orchestration.
+A production-grade hierarchical quota system with an immutable audit ledger, built with strict TypeScript, Express, Drizzle ORM, and PostgreSQL.
 
-Documents (PDF, image, video) are ingested via HTTP or Redis pub/sub, fanned out into per-page/per-frame **work units**, and processed through Celery with exponential-backoff retries. Every processing attempt is recorded as an immutable **execution generation**, so retries never destroy history and every step is safe to re-run.
+## The problem
 
-## Key concepts
-
-- **Job** -- a single uploaded document awaiting processing.
-- **Execution** -- one attempt at a job. Retries create a *new* execution generation rather than mutating the last one, so every attempt (successful or not) stays inspectable forever.
-- **Work unit** -- the smallest unit of fan-out work: one per PDF page, one per sampled video frame, one for an image.
-- **Idempotency** -- work units are keyed by a deterministic id (`execution_id:unit_type:unit_number`), so re-expanding or reprocessing the same execution generation twice never duplicates work.
-- **Status** -- a single mutable pointer per execution (`ingested -> expanded -> executing -> completed|failed`) answering "where is this execution right now" without replaying history.
-- **Audit log** -- an append-only record of every state transition. No repository method updates or deletes a row.
-- **Recovery scheduler** -- a periodic Celery task that finds executions stuck in `PROCESSING` past a threshold, marks them failed, and dispatches a fresh generation if retries remain.
-
-## Architecture
-
-Clean Architecture, dependency direction pointing inward:
+Most quota systems are a mutable counter:
 
 ```
-interfaces (FastAPI routes, Redis consumer)
-        v
-   use_cases (business rules, depend only on Protocols)
-        v
-entities (Job, Execution, WorkUnit, Status, AuditLogEntry)
-        ^
-repositories (SQLAlchemy) -- services (Celery, document processing, LLM) -- frameworks (settings, wiring)
+quota = 1000
+if quota < 100: deny
+quota -= amount
 ```
 
-See [docs/Architecture.md](docs/Architecture.md) for the full design rationale and [docs/API.md](docs/API.md) for the HTTP API reference.
+This breaks down as soon as:
+
+- **The cost isn't known until the operation finishes** (an AI completion's token count, a file upload's final size). You can't debit up front because you don't yet know the amount.
+- **A customer disputes a bill.** A single number has no explanation. You need "here is every event that produced this balance," not just the balance itself.
+- **Quota needs to nest.** A platform gives tenants a budget; tenants give their own users a slice of it. A plain counter per user has no way to express or enforce that hierarchy.
+
+## The solution
+
+**A hierarchical allocation model** (Platform -> Tenant -> User) plus **two-phase enforcement** backed by an **immutable, append-only ledger**.
+
+```
+Platform Pool (per resource type: storage / ai_tokens / api_calls)
+  └─ Tenant allocation (promised budget, committed from the platform)
+      ├─ User allocation (promised budget, committed from the tenant)
+      └─ User allocation
+```
+
+**Phase 1 — coarse pre-flight gate** (`ReserveQuota`): before an operation starts, refuse only if the balance is already at or below zero. This is deliberately coarse because the true cost isn't known yet.
+
+**Phase 2 — precise post-hoc recording** (`RecordUsage`): once the operation completes and its real cost is known, charge exactly that amount — clamped to whatever headroom remains, so a caller can never go net-negative.
+
+The result: a caller can overshoot by at most one operation's worth, and every allocation, reservation, and consumption is a permanent entry in the ledger. Balances are never stored as an independently-mutable number — they are always reconstructed by replaying the ledger, which is what makes disputes resolvable and audits trustworthy.
+
+See [docs/QuotaModel.md](docs/QuotaModel.md) for the full model and [docs/Architecture.md](docs/Architecture.md) for the Clean Architecture layout and design decisions.
 
 ## Setup
 
 ```bash
-cp .env.example .env          # edit as needed
-python3.11 -m venv .venv
-.venv/bin/pip install -r requirements.txt
-docker compose up -d          # local Postgres (5544) + Redis (6380) for dev/tests
+npm install
+cp .env.example .env        # edit as needed
+npm run db:up                # starts Postgres via docker-compose on localhost:5544
+npx drizzle-kit generate:pg  # generate SQL from the schema in src/frameworks/database.ts
+psql "$DATABASE_URL" -f drizzle/<generated>.sql   # apply it
+npm run dev
 ```
 
-Run the API:
+## API
 
-```bash
-.venv/bin/python -m src.index
-```
+All endpoints (except `/health`) require `Authorization: Bearer <jwt>`, where the token carries `{ role, tenantId?, userId? }` (see `src/frameworks/auth.ts`). Access is scoped: a `user` may only act on their own `userId`; a `tenant_admin` may act on any user within their own `tenantId`; a `platform_admin` may act on anything.
 
-Run a worker and the recovery beat schedule:
-
-```bash
-.venv/bin/celery -A src.services.celery_tasks worker --loglevel=info
-.venv/bin/celery -A src.services.celery_tasks beat --loglevel=info
-```
-
-Run the pub/sub ingestion consumer:
-
-```bash
-.venv/bin/python -c "
-import asyncio
-from src.frameworks.redis_client import create_redis_client
-from src.frameworks.database import Database
-from src.frameworks.settings import Settings
-from src.interfaces.consumers.job_consumer import JobConsumer
-
-settings = Settings.from_env()
-consumer = JobConsumer(
-    create_redis_client(settings.redis_url),
-    settings.job_ingestion_channel,
-    Database(settings).session_factory,
-)
-asyncio.run(consumer.run_forever())
-"
-```
+| Method | Path             | Purpose                                                          |
+| ------ | ---------------- | ----------------------------------------------------------------- |
+| GET    | `/health`        | Liveness probe                                                    |
+| POST   | `/quota/allocate`| Commit budget: platform → tenant, or tenant → user                |
+| POST   | `/quota/reserve` | Coarse pre-flight gate — may this operation start?                |
+| POST   | `/quota/record`  | Precise post-hoc recording of an operation's actual cost          |
+| GET    | `/quota/balance` | Reconstructed balance for a `tenantId`/`userId`/`resourceType`    |
+| GET    | `/quota/history` | Full ledger entries behind a balance — used to resolve disputes   |
 
 ## Testing
 
 ```bash
-.venv/bin/pytest                              # unit tests only (no infra required)
-docker compose up -d && .venv/bin/pytest      # unit + integration tests (real Postgres/Redis/Celery)
-.venv/bin/mypy --strict src
-.venv/bin/ruff check src
-.venv/bin/black --check src
+npm test                 # unit tests — no database required
+npm run db:up             # start Postgres for integration tests
+DATABASE_URL=postgresql://metering:metering@localhost:5544/metering npm run test:integration
 ```
 
-Integration tests (`src/tests/test_repositories.py`, `src/tests/test_integration.py`) are marked `@pytest.mark.integration` and skip automatically when the docker-compose services on ports 5544/6380 are not reachable.
+`src/tests/integration.test.ts` exercises the real Drizzle-backed repositories against a live PostgreSQL instance (allocate → reserve → record → balance → dispute replay). It skips automatically when `DATABASE_URL` is not set, so `npm test` never requires Docker.
+
+```bash
+npx tsc --noEmit    # type-check (strict mode, no `any`)
+npm run lint        # ESLint
+npm run format:check # Prettier
+npm run build        # compile to dist/
+```
+
+## Project layout
+
+Clean Architecture, dependencies pointing inward:
+
+```
+interfaces (Express controllers, middleware)
+        v
+  use-cases (business rules: ReserveQuota, RecordUsage, AllocateQuota, GetBalance, ...)
+        v
+   entities (QuotaPool, Allocation, Consumption, Ledger, Balance — pure domain logic)
+        ^
+repositories (Drizzle/Postgres) -- frameworks (Express app, DB connection, JWT)
+```
