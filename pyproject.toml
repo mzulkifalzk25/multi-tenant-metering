@@ -36,3 +36,17 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["src*"]
+
+[tool.mypy]
+strict = true
+python_version = "3.11"
+plugins = ["pydantic.mypy"]
+mypy_path = "."
+explicit_package_bases = true
+disallow_any_generics = true
+warn_unused_ignores = true
+exclude = ["^\\.venv/"]
+
+[[tool.mypy.overrides]]
+module = ["celery.*", "redis.*"]
+ignore_missing_imports = true
