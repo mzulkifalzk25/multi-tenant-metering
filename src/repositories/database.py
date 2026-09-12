@@ -35,7 +35,10 @@ class TenantModel(Base):
 
 class JobModel(Base):
     __tablename__ = "jobs"
-    __table_args__ = (Index("ix_jobs_tenant_status", "tenant_id", "status"),)
+    __table_args__ = (
+        Index("ix_jobs_tenant_status", "tenant_id", "status"),
+        Index("ix_jobs_created_at", "created_at"),
+    )
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     tenant_id: Mapped[str] = mapped_column(String(64), ForeignKey("tenants.id"), nullable=False)
@@ -55,6 +58,9 @@ class ExecutionModel(Base):
     __table_args__ = (
         UniqueConstraint("job_id", "generation", name="uq_executions_job_generation"),
         Index("ix_executions_job_status", "job_id", "status"),
+        # The recovery scheduler's list_stuck_processing scans by
+        # (status, started_at) directly, independent of job_id.
+        Index("ix_executions_status_started_at", "status", "started_at"),
     )
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
