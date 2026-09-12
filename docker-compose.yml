@@ -2,23 +2,18 @@ services:
   postgres:
     image: postgres:16-alpine
     environment:
-      POSTGRES_USER: pipeline
-      POSTGRES_PASSWORD: pipeline
-      POSTGRES_DB: document_pipeline
+      POSTGRES_USER: metering
+      POSTGRES_PASSWORD: metering
+      POSTGRES_DB: metering
     ports:
       - "5544:5432"
+    volumes:
+      - metering-postgres-data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U pipeline"]
-      interval: 5s
+      test: ["CMD-SHELL", "pg_isready -U metering"]
+      interval: 2s
       timeout: 5s
       retries: 10
 
-  redis:
-    image: redis:7-alpine
-    ports:
-      - "6380:6379"
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
+volumes:
+  metering-postgres-data:
