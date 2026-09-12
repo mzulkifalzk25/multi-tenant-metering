@@ -1,13 +1,9 @@
-import express from 'express';
+import { createApp } from './frameworks/express.js';
+import { logger } from './shared/logger.js';
 
-const app = express();
-const port = process.env['PORT'] ?? 3000;
-
-app.get('/health', (_req, res) => {
-  res.json({ status: 'ok' });
-});
+const port = Number(process.env['PORT'] ?? 3000);
+const app = createApp();
 
 app.listen(port, () => {
-  // eslint-disable-next-line no-console
-  console.log(`multi-tenant-metering listening on port ${port}`);
+  logger.info(`multi-tenant-metering listening on port ${port}`);
 });
